@@ -1,13 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
+
+const cacheTTL = 12 * time.Hour
 
 type WeatherData struct {
 	Address           string `json:"address"`
@@ -21,13 +29,34 @@ type WeatherClient struct {
 	httpClient *http.Client
 }
 
-func (c *WeatherClient) GetWeather(city string) (*WeatherData, error) {
-	url := fmt.Sprintf(
-		"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/%s?key=%s",
-		city, c.apiKey,
-	)
+func NewWeatherClient(apiKey string) *WeatherClient {
+	return &WeatherClient{
+		apiKey: apiKey,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+	}
+}
 
-	resp, err := c.httpClient.Get(url)
+func (c *WeatherClient) GetWeather(ctx context.Context, city string) ([]byte, error) {
+	q := url.Values{}
+	q.Set("key", c.apiKey)
+	q.Set("include", "current") // не тянем прогноз на 15 дней
+	q.Set("elements", "temp")   // только нужные поля
+	u := "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/" +
+		url.PathEscape(city) + "?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -41,38 +70,54 @@ func (c *WeatherClient) GetWeather(city string) (*WeatherData, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
-
-	return &data, nil
+	return json.Marshal(data)
 }
 
 type Server struct {
 	Rdb    *redis.Client
 	Client *WeatherClient
+	group  singleflight.Group
 }
 
-func (s Server) handlerWeather(w http.ResponseWriter, r *http.Request) {
-	city := r.URL.Query().Get("city")
+func (s *Server) handlerWeather(w http.ResponseWriter, r *http.Request) {
+	city := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("city")))
 	if city == "" {
 		http.Error(w, "city parameter is required", http.StatusBadRequest)
 		return
 	}
-
-	cached, err := s.Rdb.Get(r.Context(), city).Result()
-	if err == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(cached))
-		return
-	}
-
-	weather, err := s.Client.GetWeather(city)
-	if err != nil {
-		http.Error(w, "Failed to fetch weather", http.StatusInternalServerError)
-		return
-	}
-
-	jsonData, _ := json.Marshal(weather)
-	s.Rdb.Set(r.Context(), city, jsonData, 12*time.Hour)
+	key := "weather:" + city
+	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonData)
+
+	cached, err := s.Rdb.Get(ctx, key).Bytes()
+	if err == nil {
+		w.Write(cached)
+		return
+	}
+	if !errors.Is(err, redis.Nil) {
+		log.Printf("redis get: %v", err)
+	}
+
+	// одинаковые параллельные запросы схлопываются в один вызов API
+	v, err, _ := s.group.Do(key, func() (any, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		data, err := s.Client.GetWeather(fetchCtx, city)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.Rdb.Set(fetchCtx, key, data, cacheTTL).Err(); err != nil {
+			log.Printf("redis set: %v", err)
+		}
+		return data, nil
+	})
+	if err != nil {
+		log.Printf("weather fetch: %v", err)
+		http.Error(w, "Failed to fetch weather", http.StatusBadGateway)
+		return
+	}
+
+	w.Write(v.([]byte))
 }
